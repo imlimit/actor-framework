@@ -66,7 +66,7 @@ void inbound_path::stats_t::reset() {
 }
 
 inbound_path::inbound_path(stream_manager_ptr mgr_ptr, stream_slots id,
-                           strong_actor_ptr ptr)
+                           strong_actor_ptr ptr, rtti_pair in_type)
     : mgr(std::move(mgr_ptr)),
       hdl(std::move(ptr)),
       slots(id),
@@ -76,6 +76,9 @@ inbound_path::inbound_path(stream_manager_ptr mgr_ptr, stream_slots id,
       last_acked_batch_id(0),
       last_batch_id(0) {
   mgr->register_input_path(this);
+  CAF_STREAM_LOG_DEBUG("open input stream with element type "
+                       << *mgr->self()->system().types().portable_name(in_type)
+                       << "at slot" << id.receiver << "from" << hdl);
 }
 
 inbound_path::~inbound_path() {
@@ -142,10 +145,7 @@ void inbound_path::emit_ack_batch(local_actor* self, int32_t queued_items,
   if (stats.num_elements == 0)
     return;
   auto x = stats.calculate(cycle, complexity);
-  std::cout << "stats = " << stats.num_elements << "/"
-            << deep_to_string(stats.processing_time) << " => "
-            << x.max_throughput << "/" << x.items_per_batch << std::endl;
-  stats.reset();
+  auto stats_guard = detail::make_scope_guard([&] { stats.reset(); });
   // Hand out enough credit to fill our queue for 2 cycles but never exceed
   // the downstream capacity.
   auto max_capacity = std::min(x.max_throughput * 2, max_downstream_capacity);
@@ -158,15 +158,20 @@ void inbound_path::emit_ack_batch(local_actor* self, int32_t queued_items,
   CAF_ASSERT(credit >= 0);
   // The manager can restrict or adjust the amount of credit.
   credit = std::min(mgr->acquire_credit(this, credit), max_new_credit);
+  CAF_STREAM_LOG_DEBUG("credit decision at slot" << slots.receiver
+                       << "after receiving" << stats.num_elements
+                       << "elements that took" << stats.processing_time
+                       << "grants" << credit << "new credit:"
+                       << CAF_ARG2("max_throughput", x.max_throughput)
+                       << CAF_ARG(max_downstream_capacity)
+                       << CAF_ARG(assigned_credit));
   if (credit == 0 && up_to_date())
     return;
   CAF_LOG_DEBUG(CAF_ARG(assigned_credit) << CAF_ARG(max_capacity)
                 << CAF_ARG(queued_items) << CAF_ARG(credit)
                 << CAF_ARG(desired_batch_size));
-  if (credit > 0) {
-    assigned_credit += credit;
-    CAF_ASSERT(assigned_credit >= 0);
-  }
+  assigned_credit += credit;
+  CAF_ASSERT(assigned_credit >= 0);
   desired_batch_size = static_cast<int32_t>(x.items_per_batch);
   unsafe_send_as(self, hdl,
                  make<upstream_msg::ack_batch>(slots.invert(), self->address(),
